@@ -1,0 +1,64 @@
+# 局域网家庭影院 · 生产环境 Compose 编排
+#
+# 定位：服务器上只跑现成镜像，不在生产机构建 —— 本文件刻意不含 build: 段。
+# 构建请在开发机 / CI 完成：
+#   make docker-build NAMESPACE=<命名空间> && make docker-push NAMESPACE=<命名空间>
+#
+# 首次部署三步：
+#   1) 准备片库目录（MEDIA_DIR）与数据卷：docker volume create fv-data
+#   2) docker login crpi-oa7sq9hledsqbgu5.cn-hangzhou.personal.cr.aliyuncs.com   （私有仓库需要）
+#   3) IMAGE=<完整镜像地址> MEDIA_DIR=/path/to/media docker-compose up -d
+#
+# 日常运维（建议直接用 Makefile，变量已打通）：
+#   更新版本  make compose-update
+#   查看状态  make compose-ps
+#   查看日志  make compose-logs
+#   停止服务  make compose-down
+#   校验配置  make compose-config
+#
+# ⚠ docker-compose v1 已知问题：宿主 Docker 引擎 ≥ 25 时，需要重建容器的变更
+#   （改端口/换镜像 tag 后直接 `up -d`）会报 KeyError: 'ContainerConfig'。
+#   绕过：先 down 再 up（compose-update 已含），或升级 Compose v2（docker compose）。
+
+version: "3.8"
+
+services:
+  web:
+    # 镜像地址强制从环境变量 / .env 读取，避免在生产机误跑成本地构建的旧镜像
+    image: ${IMAGE:?缺少 IMAGE 变量，用法：IMAGE=<完整镜像地址> docker-compose up -d}
+    container_name: ${CONTAINER:-family-video}
+    restart: unless-stopped
+
+    ports:
+      # 局域网场景默认全网卡监听；若前面有反代可改成 "127.0.0.1:${HOST_PORT:-8080}:8080"
+      - "${HOST_PORT:-8080}:8080"
+
+    volumes:
+      # 片库：宿主机媒体目录只读挂载（容器内路径 /media，与镜像默认配置一致）
+      - ${MEDIA_DIR:?缺少 MEDIA_DIR 变量，指向宿主机影片目录}:/media:ro
+      # 持久化：配置/进度/收藏/封面缓存（命名卷，容器重建数据不丢）
+      - ${DATA_VOL:-fv-data}:/data
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    # 首启要全量扫描媒体目录 + 后台抽帧，给足启动宽限期
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - web
+
+networks:
+  web:
+    driver: bridge
