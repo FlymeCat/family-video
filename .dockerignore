@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+.git
+.data
+media
+packages/*/dist
+packages/*/tsconfig.tsbuildinfo
+Dockerfile
+docker-compose.yml
+Makefile
+*.log
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "name": "family-video",
+  "private": true,
+  "version": "1.0.0",
+  "description": "局域网家庭影院 - React + Ant Design + TypeScript + Express",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"pnpm --filter @fv/server dev\" \"pnpm --filter @fv/web dev\"",
+    "build": "pnpm --filter @fv/web build",
+    "start": "pnpm --filter @fv/server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "ffmpeg-static": "^5.3.0"
+  },
+  "packageManager": "pnpm@11.23.0"
+}

@@ -1,0 +1,6 @@
+packages:
+  - "packages/*"
+
+allowBuilds:
+  esbuild: true
+  ffmpeg-static: false
