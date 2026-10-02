@@ -5,7 +5,8 @@ import express from 'express';
 import cors from 'cors';
 import { loadConfig, saveConfig, WEB_DIST } from './config.js';
 import { scanAll } from './scanner.js';
-import { streamRange } from './stream.js';
+import { streamRange, streamTranscodedAudio } from './stream.js';
+import { probeMedia } from './probe.js';
 import { toVtt } from './subtitles.js';
 import { store } from './store.js';
 import { fillCachedThumbs, getThumbnailPath, queueThumbnailGeneration } from './thumbnails.js';
@@ -111,7 +112,19 @@ app.post('/api/library/refresh', async (_req, res) => {
 app.get('/api/media/:id/stream', async (req, res) => {
   const movie = library.byId.get(req.params.id);
   if (!movie) return res.status(404).json({ error: '影片不存在' });
+  // 音频兼容模式：视频 copy、音轨转 AAC，供不支持 AC3/E-AC3/DTS 的设备（电视/手机）播放
+  if (req.query.transcode === '1') {
+    const start = Number(req.query.start ?? 0) || 0;
+    return streamTranscodedAudio(req, res, movie.path, start);
+  }
   await streamRange(req, res, movie.path, movie.mime);
+});
+
+// ---------- 媒体编码探测（前端据此判断是否需要音频兼容模式） ----------
+app.get('/api/media/:id/probe', async (req, res) => {
+  const movie = library.byId.get(req.params.id);
+  if (!movie) return res.status(404).json({ error: '影片不存在' });
+  res.json(await probeMedia(movie));
 });
 
 // ---------- 缩略图 ----------

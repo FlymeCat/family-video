@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Dropdown, Slider, Spin, Tooltip, Typography, App } from 'antd';
 import {
   ArrowLeftOutlined,
+  AudioOutlined,
   FullscreenExitOutlined,
   FullscreenOutlined,
+  GlobalOutlined,
   LoadingOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
@@ -15,12 +17,48 @@ import {
 } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api/client';
-import type { Movie } from '../types';
+import type { MediaProbe, Movie } from '../types';
 import { formatTime } from '../utils/format';
 
 const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 /** 进度上报间隔（毫秒） */
 const REPORT_INTERVAL = 5000;
+/** 浏览器普遍原生支持、无需转码的音频编码 */
+const NATIVE_AUDIO = new Set(['aac', 'mp3']);
+
+/** 进入全屏（兼容各内核前缀与 iOS 视频原生全屏） */
+function requestFull(el: HTMLElement, video?: HTMLVideoElement | null): void {
+  const anyEl = el as HTMLElement & {
+    webkitRequestFullscreen?: () => void;
+    msRequestFullscreen?: () => void;
+  };
+  if (el.requestFullscreen) void el.requestFullscreen().catch(() => useVideoFs(video));
+  else if (anyEl.webkitRequestFullscreen) anyEl.webkitRequestFullscreen();
+  else if (anyEl.msRequestFullscreen) void anyEl.msRequestFullscreen();
+  else useVideoFs(video);
+}
+// iOS Safari 只支持视频元素自身全屏
+function useVideoFs(video?: HTMLVideoElement | null): void {
+  const v = video as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null;
+  if (v?.webkitEnterFullscreen) v.webkitEnterFullscreen();
+  else v?.requestFullscreen?.().catch(() => undefined);
+}
+function exitFull(): void {
+  const d = document as Document & {
+    webkitFullscreenElement?: Element;
+    webkitExitFullscreen?: () => void;
+  };
+  if (d.fullscreenElement && d.exitFullscreen) void d.exitFullscreen();
+  else if (d.webkitFullscreenElement && d.webkitExitFullscreen) d.webkitExitFullscreen();
+  else {
+    const v = document.querySelector('video') as (HTMLVideoElement & { webkitExitFullscreen?: () => void }) | null;
+    v?.webkitExitFullscreen?.();
+  }
+}
+function isFullscreen(): boolean {
+  const d = document as Document & { webkitFullscreenElement?: Element };
+  return Boolean(d.fullscreenElement || d.webkitFullscreenElement);
+}
 
 export default function Player() {
   const { id = '' } = useParams();
@@ -31,8 +69,13 @@ export default function Player() {
   const containerRef = useRef<HTMLDivElement>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastReportRef = useRef(0);
+  /** 普通模式下待恢复的绝对播放位置（seek） */
+  const pendingSeekRef = useRef<number | null>(null);
+  /** 兼容模式：当前应自动续播 */
+  const wantPlayRef = useRef(true);
 
   const [movie, setMovie] = useState<Movie | null>(null);
+  const [probe, setProbe] = useState<MediaProbe | null>(null);
   const [notFound, setNotFound] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -43,34 +86,43 @@ export default function Player() {
   const [rate, setRate] = useState(1);
   const [fullscreen, setFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
-  /** -1 关闭；0..n 字幕轨道索引 */
   const [subtitleTrack, setSubtitleTrack] = useState(-1);
   const [favorite, setFavorite] = useState(false);
+  /** 音频兼容模式：视频不转码、音轨转 AAC */
+  const [audioCompat, setAudioCompat] = useState(false);
+  /** 兼容模式流的起播偏移（秒），seek 靠带 start 重建流实现 */
+  const [streamStart, setStreamStart] = useState(0);
+  /** 拖动进度条时的预览位置（绝对秒） */
+  const [previewTime, setPreviewTime] = useState<number | null>(null);
 
-  // ---------- 加载影片与断点 ----------
+  // ---------- 加载影片、探测编码与断点 ----------
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [m, favorites, progressList] = await Promise.all([
+        const [m, favorites, progressList, pr] = await Promise.all([
           api.getMovie(id),
           api.getFavorites(),
           api.getProgress(),
+          api.getProbe(id).catch(() => null),
         ]);
         if (cancelled) return;
         setMovie(m);
+        setProbe(pr);
         setFavorite(favorites.includes(m.id));
+
+        // 音轨编码浏览器不原生支持（AC3/E-AC3/DTS 等）→ 自动开启兼容模式（电视/手机有声）
+        const needCompat = !!pr?.audioCodec && !NATIVE_AUDIO.has(pr.audioCodec);
+
         const p = progressList.find((x) => x.movieId === m.id);
-        // 断点续播：跳过开头，距结尾 30 秒内视为看完
-        if (p && p.duration > 0 && p.position > 5 && p.position < p.duration - 30) {
-          const v = videoRef.current;
-          if (v) {
-            const seek = (e: Event) => {
-              (e.target as HTMLVideoElement).currentTime = p.position;
-              v.removeEventListener('loadedmetadata', seek);
-            };
-            v.addEventListener('loadedmetadata', seek);
-          }
+        const resuming = p && p.duration > 0 && p.position > 5 && p.position < p.duration - 30;
+        wantPlayRef.current = true;
+        if (needCompat) {
+          setAudioCompat(true);
+          setStreamStart(resuming ? Math.floor(p!.position) : 0);
+          message.info('该影片音轨格式兼容性较低，已开启音频兼容模式');
+        } else if (resuming) {
+          pendingSeekRef.current = p!.position;
         }
       } catch {
         if (!cancelled) setNotFound(true);
@@ -79,17 +131,25 @@ export default function Player() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, message]);
 
   // ---------- 进度上报 ----------
+  /** 当前绝对位置（秒）：兼容模式 = 流偏移 + 流内时间 */
+  const absoluteTime = useCallback(
+    (relTime: number) => (audioCompat ? streamStart + relTime : relTime),
+    [audioCompat, streamStart],
+  );
+
   const reportProgress = useCallback(() => {
     const v = videoRef.current;
-    if (!v || !movie || v.paused || !v.duration || Number.isNaN(v.duration)) return;
+    if (!v || !movie || v.paused) return;
+    const total = audioCompat ? probe?.durationSec ?? 0 : v.duration || 0;
+    if (!total) return;
     const now = Date.now();
     if (now - lastReportRef.current < REPORT_INTERVAL) return;
     lastReportRef.current = now;
-    void api.saveProgress(movie.id, v.currentTime, v.duration).catch(() => undefined);
-  }, [movie]);
+    void api.saveProgress(movie.id, absoluteTime(v.currentTime), total).catch(() => undefined);
+  }, [movie, audioCompat, probe, absoluteTime]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -99,30 +159,35 @@ export default function Player() {
       reportProgress();
     };
     const onLoaded = () => {
-      setDuration(v.duration || 0);
-      void v.play().catch(() => setPlaying(false));
+      setDuration(audioCompat ? probe?.durationSec ?? 0 : v.duration || 0);
+      if (pendingSeekRef.current != null && !audioCompat) {
+        v.currentTime = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+      }
+      if (wantPlayRef.current) void v.play().catch(() => setPlaying(false));
     };
     const onPlay = () => setPlaying(true);
     const onPause = () => {
       setPlaying(false);
-      // 暂停时立即上报一次
+      const total = audioCompat ? probe?.durationSec ?? 0 : v.duration || 0;
       const now = Date.now();
-      if (movie && now - lastReportRef.current > 1000 && v.duration) {
+      if (movie && total && now - lastReportRef.current > 1000) {
         lastReportRef.current = now;
-        void api.saveProgress(movie.id, v.currentTime, v.duration).catch(() => undefined);
+        void api.saveProgress(movie.id, absoluteTime(v.currentTime), total).catch(() => undefined);
       }
     };
     const onBuffer = () => {
       if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1));
+    };
+    const onEnded = () => {
+      const total = audioCompat ? probe?.durationSec ?? 0 : v.duration || 0;
+      if (movie && total) void api.saveProgress(movie.id, total, total).catch(() => undefined);
     };
     v.addEventListener('timeupdate', onTime);
     v.addEventListener('loadedmetadata', onLoaded);
     v.addEventListener('play', onPlay);
     v.addEventListener('pause', onPause);
     v.addEventListener('progress', onBuffer);
-    const onEnded = () => {
-      if (movie && v.duration) void api.saveProgress(movie.id, v.duration, v.duration).catch(() => undefined);
-    };
     v.addEventListener('ended', onEnded);
     return () => {
       v.removeEventListener('timeupdate', onTime);
@@ -132,31 +197,42 @@ export default function Player() {
       v.removeEventListener('progress', onBuffer);
       v.removeEventListener('ended', onEnded);
     };
-  }, [movie, reportProgress]);
+  }, [movie, audioCompat, probe, absoluteTime, reportProgress]);
 
-  // ---------- 全屏 ----------
+  // ---------- 全屏（含 webkit 前缀事件） ----------
   useEffect(() => {
-    const onChange = () => setFullscreen(Boolean(document.fullscreenElement));
+    const onChange = () => setFullscreen(isFullscreen());
     document.addEventListener('fullscreenchange', onChange);
-    return () => document.removeEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange as EventListener);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange as EventListener);
+    };
   }, []);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
+    wantPlayRef.current = v.paused;
     if (v.paused) void v.play();
     else v.pause();
   }, []);
 
-  const seekBy = useCallback((delta: number) => {
-    const v = videoRef.current;
-    if (!v) return;
-    v.currentTime = Math.min(Math.max(0, v.currentTime + delta), v.duration || 0);
-  }, []);
+  const seekBy = useCallback(
+    (delta: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      const total = audioCompat ? probe?.durationSec ?? 0 : v.duration || 0;
+      const target = Math.min(Math.max(0, absoluteTime(v.currentTime) + delta), total || absoluteTime(v.currentTime));
+      if (audioCompat) setStreamStart(Math.floor(target));
+      else v.currentTime = target;
+    },
+    [audioCompat, probe, absoluteTime],
+  );
 
   const toggleFullscreen = useCallback(() => {
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else void containerRef.current?.requestFullscreen();
+    if (isFullscreen()) exitFull();
+    else if (containerRef.current) requestFull(containerRef.current, videoRef.current);
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -165,6 +241,23 @@ export default function Player() {
     v.muted = !v.muted;
     setMuted(v.muted);
   }, []);
+
+  /** 手动切换音频兼容模式，尽量保持当前位置 */
+  const toggleAudioCompat = useCallback(() => {
+    const v = videoRef.current;
+    const at = v ? absoluteTime(v.currentTime) : 0;
+    const next = !audioCompat;
+    wantPlayRef.current = true;
+    if (next) {
+      setStreamStart(Math.floor(at));
+      setAudioCompat(true);
+      message.success('已开启音频兼容模式（视频不转码，仅音轨转 AAC）');
+    } else {
+      pendingSeekRef.current = at;
+      setAudioCompat(false);
+      message.info('已切换回原始音轨（原生流式播放）');
+    }
+  }, [audioCompat, absoluteTime, message]);
 
   // ---------- 键盘快捷键：空格播放、左右 ±10s、上下音量、F 全屏、M 静音 ----------
   useEffect(() => {
@@ -231,23 +324,31 @@ export default function Player() {
     return <SoundOutlined />;
   }, [muted, volume]);
 
+  /** 进度条显示位置（绝对秒） */
+  const displayTime = previewTime ?? absoluteTime(currentTime);
+  const bufferedAbs = audioCompat ? streamStart + buffered : buffered;
+  const bufferedPct = duration > 0 ? Math.min(100, (bufferedAbs / duration) * 100) : 0;
+  // 暂停时强制显示控制层，避免自动隐藏后点击穿透到视频误触发播放
+  const controlsShown = controlsVisible || !playing;
+
+  const videoSrc = useMemo(() => {
+    if (!movie) return undefined;
+    return audioCompat ? api.transcodeStreamUrl(movie.id, streamStart) : api.streamUrl(movie.id);
+  }, [movie, audioCompat, streamStart]);
+
   if (notFound) {
     return (
-      <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
+      <div style={{ height: '100dvh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
         <Typography.Text style={{ color: '#fff' }}>影片不存在或已被删除</Typography.Text>
         <Button onClick={() => navigate('/library')}>返回媒体库</Button>
       </div>
     );
   }
 
-  const bufferedPct = duration > 0 ? (buffered / duration) * 100 : 0;
-  // 暂停时强制显示控制层，避免自动隐藏后点击穿透到视频误触发播放
-  const controlsShown = controlsVisible || !playing;
-
   return (
     <div
       ref={containerRef}
-      style={{ position: 'relative', width: '100vw', height: '100vh', background: '#000', overflow: 'hidden' }}
+      style={{ position: 'relative', width: '100vw', height: '100dvh', background: '#000', overflow: 'hidden' }}
       onMouseMove={showControls}
       onTouchStart={showControls}
     >
@@ -259,7 +360,7 @@ export default function Player() {
         <>
           <video
             ref={videoRef}
-            src={api.streamUrl(movie.id)}
+            src={videoSrc}
             poster={movie.thumb ?? undefined}
             playsInline
             preload="metadata"
@@ -352,14 +453,14 @@ export default function Player() {
                 min={0}
                 max={duration || 0}
                 step={0.1}
-                value={currentTime}
+                value={Math.min(displayTime, duration || 0)}
                 tooltip={{ formatter: (v) => formatTime(Number(v)) }}
-                onChange={(v) => {
+                onChange={(v) => setPreviewTime(v)}
+                onAfterChange={(v) => {
                   const el = videoRef.current;
-                  if (el) {
-                    el.currentTime = v;
-                    setCurrentTime(v);
-                  }
+                  if (audioCompat) setStreamStart(Math.floor(v));
+                  else if (el) el.currentTime = v;
+                  setPreviewTime(null);
                 }}
                 style={{ position: 'relative' }}
               />
@@ -371,7 +472,7 @@ export default function Player() {
               </Tooltip>
 
               <Typography.Text style={{ color: '#fff', fontSize: 13, whiteSpace: 'nowrap' }}>
-                {formatTime(currentTime)} / {formatTime(duration)}
+                {formatTime(displayTime)} / {formatTime(duration)}
               </Typography.Text>
 
               <Tooltip title="静音 (M)">
@@ -401,7 +502,6 @@ export default function Player() {
                   items: PLAYBACK_RATES.map((r) => ({
                     key: String(r),
                     label: `${r}x`,
-                    selected: r === rate,
                     onClick: () => {
                       const el = videoRef.current;
                       if (el) {
@@ -422,11 +522,7 @@ export default function Player() {
                 <Dropdown
                   menu={{
                     items: [
-                      {
-                        key: '-1',
-                        label: '关闭字幕',
-                        onClick: () => setSubtitleTrack(-1),
-                      },
+                      { key: '-1', label: '关闭字幕', onClick: () => setSubtitleTrack(-1) },
                       ...movie.subtitles.map((s, i) => ({
                         key: String(i),
                         label: s.lang ? `${s.label} (${s.lang})` : s.label,
@@ -436,14 +532,22 @@ export default function Player() {
                   }}
                 >
                   <Tooltip title="字幕">
-                    <Button
-                      type="text"
-                      style={{ color: subtitleTrack >= 0 ? '#e50914' : '#fff' }}
-                      icon={<ReadOutlined />}
-                    />
+                    <Button type="text" style={{ color: subtitleTrack >= 0 ? '#e50914' : '#fff' }} icon={<ReadOutlined />} />
                   </Tooltip>
                 </Dropdown>
               )}
+
+              {/* 音频模式切换（音轨编码不兼容时尤其有用） */}
+              <Tooltip title={audioCompat ? '当前：音频兼容模式（AAC）' : '当前：原始音轨直传'}>
+                <Button
+                  type="text"
+                  style={{ color: audioCompat ? '#e50914' : '#fff' }}
+                  icon={audioCompat ? <GlobalOutlined /> : <AudioOutlined />}
+                  onClick={toggleAudioCompat}
+                >
+                  {audioCompat ? '兼容音' : '原音轨'}
+                </Button>
+              </Tooltip>
 
               <div style={{ flex: 1 }} />
 

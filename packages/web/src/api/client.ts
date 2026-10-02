@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getDeviceId } from '../device';
-import type { Movie, Progress, ServerConfig } from '../types';
+import type { Movie, Progress, ServerConfig, MediaProbe } from '../types';
 
 // 首次扫描大目录（如 Windows 挂载盘）可能较慢，超时放宽到 60s
 const http = axios.create({ baseURL: '/api', timeout: 60000 });
@@ -54,6 +54,14 @@ export const api = {
     await http.put('/config', { mediaRoots });
   },
 
+  async getProbe(id: string): Promise<MediaProbe> {
+    const { data } = await http.get(`/media/${id}/probe`);
+    return data as MediaProbe;
+  },
+
   streamUrl: (id: string) => `/api/media/${id}/stream`,
+  /** 音频兼容模式流：视频不转码、音轨转 AAC，start 为起播秒（seek 靠重建流） */
+  transcodeStreamUrl: (id: string, start = 0) =>
+    `/api/media/${id}/stream?transcode=1&start=${Math.max(0, Math.floor(start))}`,
   subtitleUrl: (id: string, track: number) => `/api/media/${id}/subtitle?track=${track}`,
 };

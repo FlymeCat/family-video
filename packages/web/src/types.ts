@@ -31,6 +31,13 @@ export interface Progress {
   updatedAt: number;
 }
 
+/** 后端 ffmpeg 探测结果 */
+export interface MediaProbe {
+  durationSec: number | null;
+  audioCodec: string | null;
+  videoCodec: string | null;
+}
+
 export interface ServerConfig {
   mediaRoots: string[];
   port: number;
