@@ -25,6 +25,11 @@ const DEFAULT_ROOT = path.resolve(process.env.FV_MEDIA_DIR || path.join(PROJECT_
 const DEFAULT_CONFIG: AppConfig = {
   mediaRoots: [DEFAULT_ROOT],
   port: Number(process.env.PORT || 8080),
+  lan: {
+    udpPort: Number(process.env.FV_LAN_UDP_PORT || 9527),
+    tcpPort: Number(process.env.FV_LAN_TCP_PORT || 9528),
+  },
+  publicBaseUrl: (process.env.FV_PUBLIC_BASE_URL || '').trim() || undefined,
 };
 
 let cached: AppConfig | null = null;
@@ -47,6 +52,15 @@ export async function loadConfig(): Promise<AppConfig> {
           ? parsed.mediaRoots.map((r) => path.resolve(r))
           : DEFAULT_CONFIG.mediaRoots,
       port: typeof parsed.port === 'number' ? parsed.port : DEFAULT_CONFIG.port,
+      // 旧版 config.json 无 lan 字段时回退默认端口，保证平滑升级
+      lan: {
+        udpPort: parsed.lan?.udpPort || DEFAULT_CONFIG.lan.udpPort,
+        tcpPort: parsed.lan?.tcpPort || DEFAULT_CONFIG.lan.tcpPort,
+      },
+      publicBaseUrl:
+        typeof parsed.publicBaseUrl === 'string' && parsed.publicBaseUrl.trim()
+          ? parsed.publicBaseUrl.trim()
+          : DEFAULT_CONFIG.publicBaseUrl,
     };
   } catch {
     cached = { ...DEFAULT_CONFIG, mediaRoots: [...DEFAULT_CONFIG.mediaRoots] };

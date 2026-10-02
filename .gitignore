@@ -5,3 +5,10 @@ dist/
 media/
 *.log
 .DS_Store
+# 环境变量与方案1证书（含私钥，勿入库）
+.env
+deploy/caddy/certs/*.pem
+deploy/caddy/certs/*.key
+deploy/caddy/certs/*.crt
+# TypeScript 增量编译产物（不应入库）
+*.tsbuildinfo

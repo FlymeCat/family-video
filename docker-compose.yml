@@ -32,6 +32,9 @@ services:
     ports:
       # 局域网场景默认全网卡监听；若前面有反代可改成 "127.0.0.1:${HOST_PORT:-8080}:8080"
       - "${HOST_PORT:-8080}:8080"
+      # 微信小程序局域网通信：UDP 服务发现 + TCP 控制面 JSON-RPC
+      - "${LAN_UDP_PORT:-9527}:9527/udp"
+      - "${LAN_TCP_PORT:-9528}:9528/tcp"
 
     volumes:
       # 片库：宿主机媒体目录只读挂载（容器内路径 /media，与镜像默认配置一致）
@@ -41,6 +44,8 @@ services:
 
     environment:
       - TZ=Asia/Shanghai
+      # 对外 HTTPS 基础地址（微信小程序 <video> 播放用，需已备案域名 + 反代），留空则仅可浏览不可播放
+      - FV_PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
 
     # 首启要全量扫描媒体目录 + 后台抽帧，给足启动宽限期
     healthcheck:
@@ -58,6 +63,33 @@ services:
 
     networks:
       - web
+
+  # 方案1：HTTPS 反代（微信小程序 <video> 播放）——默认不启，靠 profiles 门控。
+  # 启动： FV_DOMAIN=<备案域名> docker compose --profile caddy up -d
+  # 前置：先跑 deploy/caddy/issue-cert.sh 生成 ./deploy/caddy/certs/{fullchain,privkey}.pem
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2}
+    container_name: ${CADDY_CONTAINER:-fv-caddy}
+    restart: unless-stopped
+    profiles: ["caddy"]
+    ports:
+      - "443:443"
+      - "80:80"
+    environment:
+      - FV_DOMAIN=${FV_DOMAIN:-tv.example.com}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/caddy/certs:/etc/caddy/certs:ro
+      - fv-caddy-data:/data
+      - fv-caddy-config:/config
+    depends_on:
+      - web
+    networks:
+      - web
+
+volumes:
+  fv-caddy-data:
+  fv-caddy-config:
 
 networks:
   web:

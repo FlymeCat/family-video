@@ -1,79 +1,27 @@
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
 import { loadConfig, saveConfig, WEB_DIST } from './config.js';
-import { scanAll } from './scanner.js';
 import { streamRange, streamTranscodedAudio } from './stream.js';
 import { probeMedia } from './probe.js';
 import { toVtt } from './subtitles.js';
 import { store } from './store.js';
-import { fillCachedThumbs, getThumbnailPath, queueThumbnailGeneration } from './thumbnails.js';
-import type { Movie, Progress } from './types.js';
-
-interface Library {
-  movies: Movie[];
-  byId: Map<string, Movie>;
-  fingerprints: Record<string, string>;
-  scannedAt: number;
-}
-
-/** 内存影片库缓存 */
-let library: Library = { movies: [], byId: new Map(), fingerprints: {}, scannedAt: 0 };
-let scanning: Promise<void> | null = null;
-
-async function rescan(force = false): Promise<void> {
-  // 并发合并：多个请求触发扫描时复用同一次扫描
-  if (scanning) return scanning;
-  scanning = (async () => {
-    try {
-      const cfg = await loadConfig();
-      const { movies, fingerprints } = await scanAll(cfg.mediaRoots);
-      const changed =
-        force ||
-        Object.keys(fingerprints).join() !== Object.keys(library.fingerprints).join() ||
-        Object.entries(fingerprints).some(([k, v]) => library.fingerprints[k] !== v);
-      if (changed) {
-        // 封面：先填充已有缓存（快），缺少的进后台队列生成（不阻塞请求）
-        const missing = await fillCachedThumbs(movies);
-        queueThumbnailGeneration(missing);
-        library = {
-          movies,
-          byId: new Map(movies.map((m) => [m.id, m])),
-          fingerprints,
-          scannedAt: Date.now(),
-        };
-        console.log(`[library] 扫描完成，共 ${movies.length} 部影片，待生成封面 ${missing.length} 张`);
-      }
-    } finally {
-      scanning = null;
-    }
-  })();
-  return scanning;
-}
-
-/**
- * 后台刷新：请求路径不等扫描（慢盘全量扫描可达十几秒），直接返回内存缓存；
- * 距上次扫描超过 30 秒时触发一次后台扫描，扫完自然对后续请求生效。
- */
-function refreshInBackground(): void {
-  if (scanning) return;
-  if (Date.now() - library.scannedAt < 30_000) return;
-  void rescan();
-}
-
-function lanAddresses(port: number): string[] {
-  return Object.entries(os.networkInterfaces())
-    // 过滤 docker/网桥等虚拟网卡，只保留真实局域网接口
-    .filter(([name]) => !/^(docker|br-|veth|virbr|lo)/.test(name))
-    .flatMap(([, infos]) => infos ?? [])
-    .filter((i): i is os.NetworkInterfaceInfo => Boolean(i))
-    .filter((i) => i.family === 'IPv4' && !i.internal)
-    .map((i) => `http://${i.address}:${port}`);
-}
+import { getThumbnailPath } from './thumbnails.js';
+import { startLanServers } from './lan.js';
+import {
+  filterMovies,
+  findMovie,
+  getLibrary,
+  lanAddresses,
+  refreshInBackground,
+  refreshThumbs,
+  rescan,
+} from './library.js';
+import type { Progress } from './types.js';
 
 const app = express();
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json());
 
@@ -81,36 +29,30 @@ app.use(express.json());
 app.get('/api/movies', async (req, res) => {
   refreshInBackground();
   // 填充后台新生成的封面（仅文件存在性检查，毫秒级）
-  await fillCachedThumbs(library.movies);
-  const keyword = String(req.query.keyword ?? '').trim().toLowerCase();
-  const category = String(req.query.category ?? '').trim();
-  let movies = library.movies;
-  if (category === 'movie' || category === 'series') {
-    movies = movies.filter((m) => m.category === category);
-  }
-  if (keyword) {
-    movies = movies.filter(
-      (m) => m.title.toLowerCase().includes(keyword) || m.fileName.toLowerCase().includes(keyword),
-    );
-  }
+  await refreshThumbs();
+  const movies = filterMovies({
+    keyword: String(req.query.keyword ?? ''),
+    category: String(req.query.category ?? ''),
+  });
   res.json({ total: movies.length, movies });
 });
 
 app.get('/api/movies/:id', async (req, res) => {
   refreshInBackground();
-  const movie = library.byId.get(req.params.id);
+  const movie = findMovie(req.params.id);
   if (!movie) return res.status(404).json({ error: '影片不存在' });
   res.json(movie);
 });
 
 app.post('/api/library/refresh', async (_req, res) => {
   await rescan(true);
-  res.json({ total: library.movies.length, scannedAt: library.scannedAt });
+  const lib = getLibrary();
+  res.json({ total: lib.movies.length, scannedAt: lib.scannedAt });
 });
 
 // ---------- 流式播放 ----------
 app.get('/api/media/:id/stream', async (req, res) => {
-  const movie = library.byId.get(req.params.id);
+  const movie = findMovie(req.params.id);
   if (!movie) return res.status(404).json({ error: '影片不存在' });
   // 音频兼容模式：视频 copy、音轨转 AAC，供不支持 AC3/E-AC3/DTS 的设备（电视/手机）播放
   if (req.query.transcode === '1') {
@@ -122,14 +64,14 @@ app.get('/api/media/:id/stream', async (req, res) => {
 
 // ---------- 媒体编码探测（前端据此判断是否需要音频兼容模式） ----------
 app.get('/api/media/:id/probe', async (req, res) => {
-  const movie = library.byId.get(req.params.id);
+  const movie = findMovie(req.params.id);
   if (!movie) return res.status(404).json({ error: '影片不存在' });
   res.json(await probeMedia(movie));
 });
 
 // ---------- 缩略图 ----------
 app.get('/api/media/:id/thumbnail', async (req, res) => {
-  const movie = library.byId.get(req.params.id);
+  const movie = findMovie(req.params.id);
   if (!movie || !movie.thumb) return res.status(404).end();
   const file = await getThumbnailPath(movie);
   try {
@@ -143,7 +85,7 @@ app.get('/api/media/:id/thumbnail', async (req, res) => {
 
 // ---------- 字幕（统一转 WebVTT） ----------
 app.get('/api/media/:id/subtitle', async (req, res) => {
-  const movie = library.byId.get(req.params.id);
+  const movie = findMovie(req.params.id);
   if (!movie) return res.status(404).json({ error: '影片不存在' });
   const idx = Number(req.query.track ?? 0);
   const sub = movie.subtitles[idx];
@@ -215,12 +157,15 @@ app.post('/api/favorites/batch', async (req, res) => {
 // ---------- 配置 ----------
 app.get('/api/config', async (_req, res) => {
   const cfg = await loadConfig();
+  const lib = getLibrary();
   res.json({
     mediaRoots: cfg.mediaRoots,
     port: cfg.port,
+    lan: cfg.lan,
+    publicBaseUrl: cfg.publicBaseUrl ?? null,
     lanUrls: lanAddresses(cfg.port),
-    movieCount: library.movies.length,
-    lastScan: library.scannedAt,
+    movieCount: lib.movies.length,
+    lastScan: lib.scannedAt,
   });
 });
 
@@ -243,12 +188,12 @@ app.put('/api/config', async (req, res) => {
   const next = { ...cfg, mediaRoots: valid };
   await saveConfig(next);
   await rescan(true);
-  res.json({ mediaRoots: valid, movieCount: library.movies.length });
+  res.json({ mediaRoots: valid, movieCount: getLibrary().movies.length });
 });
 
 // ---------- 健康检查 ----------
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, movies: library.movies.length });
+  res.json({ ok: true, movies: getLibrary().movies.length });
 });
 
 // ---------- 首页：托管前端构建产物 ----------
@@ -270,6 +215,8 @@ async function main(): Promise<void> {
     await fs.mkdir(root, { recursive: true }).catch(() => undefined);
   }
   await rescan(true);
+  // 启动局域网 UDP 发现 + TCP 通信服务（供微信小程序免域名访问控制面）
+  startLanServers(cfg, () => getLibrary().movies.length);
   // 不指定 host：监听所有接口（IPv4+IPv6），局域网设备和本机 localhost（含 ::1）都能访问
   app.listen(cfg.port, () => {
     console.log(`[server] 家庭影院已启动（局域网可访问）：`);

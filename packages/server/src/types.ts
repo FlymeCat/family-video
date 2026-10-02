@@ -64,9 +64,24 @@ export interface Favorite {
   createdAt: number;
 }
 
+/** 局域网通信（微信小程序 TCP Socket 通道）配置 */
+export interface LanConfig {
+  /** UDP 服务发现端口 */
+  udpPort: number;
+  /** TCP JSON-RPC 通信端口 */
+  tcpPort: number;
+}
+
 /** 服务端配置 */
 export interface AppConfig {
   /** 媒体根目录（绝对路径）列表 */
   mediaRoots: string[];
   port: number;
+  /** 局域网通信层端口配置 */
+  lan: LanConfig;
+  /**
+   * 对外 HTTPS 基础地址（微信小程序 <video> 播放用，必须已备案域名）。
+   * 留空时小程序无法在发布版播放视频，仅可浏览。
+   */
+  publicBaseUrl?: string;
 }

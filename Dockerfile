@@ -58,10 +58,13 @@ COPY --from=build /app /app
 # FV_MEDIA_DIR：默认媒体目录（仅当卷内无 config.json 时生效；也可启动后在"设置"页修改）
 ENV NODE_ENV=production \
     PORT=8080 \
+    FV_LAN_UDP_PORT=9527 \
+    FV_LAN_TCP_PORT=9528 \
     FV_DATA_DIR=/data \
     FV_MEDIA_DIR=/media
 
-EXPOSE 8080
+# 8080：API + 前端页面；9527/udp：微信小程序服务发现；9528/tcp：微信小程序控制面 JSON-RPC
+EXPOSE 8080 9527/udp 9528/tcp
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
